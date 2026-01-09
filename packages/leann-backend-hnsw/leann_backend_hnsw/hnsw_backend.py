@@ -90,14 +90,8 @@ class HNSWBuilder(LeannBackendBuilderInterface):
         index_file = index_dir / f"{index_prefix}.index"
         faiss.write_index(index, str(index_file))
 
-        # Persist ID map so searcher can map FAISS integer labels back to passage IDs
-        try:
-            idmap_file = index_dir / f"{index_prefix}.ids.txt"
-            with open(idmap_file, "w", encoding="utf-8") as f:
-                for id_str in ids:
-                    f.write(str(id_str) + "\n")
-        except Exception as e:
-            logger.warning(f"Failed to write ID map: {e}")
+        # Note: ID map (.ids.txt) is written by the API layer after backend.build() returns
+        # This ensures the API has authoritative control over the ID mapping
 
         if self.is_compact:
             self._convert_to_csr(index_file)

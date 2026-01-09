@@ -457,20 +457,20 @@ class LeannBuilder:
             provider_options=self.embedding_options,
         )
         string_ids = [chunk["id"] for chunk in self.chunks]
-        # Persist ID map alongside index so backends that return integer labels can remap to passage IDs
-        try:
-            idmap_file = (
-                index_dir
-                / f"{index_name[: -len('.leann')] if index_name.endswith('.leann') else index_name}.ids.txt"
-            )
-            with open(idmap_file, "w", encoding="utf-8") as f:
-                for sid in string_ids:
-                    f.write(str(sid) + "\n")
-        except Exception:
-            pass
         current_backend_kwargs = {**self.backend_kwargs, "dimensions": self.dimensions}
         builder_instance = self.backend_factory.builder(**current_backend_kwargs)
         builder_instance.build(embeddings, string_ids, index_path, **current_backend_kwargs)
+
+        # Persist ID map AFTER backend.build() to ensure it's authoritative
+        # The backend may also write this file, but we overwrite with the correct data
+        idmap_file = (
+            index_dir
+            / f"{index_name[: -len('.leann')] if index_name.endswith('.leann') else index_name}.ids.txt"
+        )
+        with open(idmap_file, "w", encoding="utf-8") as f:
+            for sid in string_ids:
+                f.write(str(sid) + "\n")
+        logger.info("Wrote %d IDs to %s", len(string_ids), idmap_file)
         leann_meta_path = index_dir / f"{index_name}.meta.json"
         meta_data = {
             "version": "1.0",
@@ -501,6 +501,10 @@ class LeannBuilder:
             is_recompute = self.backend_kwargs.get("is_recompute", True)
             meta_data["is_compact"] = is_compact
             meta_data["is_pruned"] = bool(is_recompute)
+
+        # Track total passages for sync/update operations
+        meta_data["total_passages"] = len(self.chunks)
+
         with open(leann_meta_path, "w", encoding="utf-8") as f:
             json.dump(meta_data, f, indent=2)
 
@@ -587,20 +591,19 @@ class LeannBuilder:
 
         # Build the vector index using precomputed embeddings
         string_ids = [str(id_val) for id_val in ids]
-        # Persist ID map (order == embeddings order)
-        try:
-            idmap_file = (
-                index_dir
-                / f"{index_name[: -len('.leann')] if index_name.endswith('.leann') else index_name}.ids.txt"
-            )
-            with open(idmap_file, "w", encoding="utf-8") as f:
-                for sid in string_ids:
-                    f.write(str(sid) + "\n")
-        except Exception:
-            pass
         current_backend_kwargs = {**self.backend_kwargs, "dimensions": self.dimensions}
         builder_instance = self.backend_factory.builder(**current_backend_kwargs)
         builder_instance.build(embeddings, string_ids, index_path)
+
+        # Persist ID map AFTER backend.build() to ensure it's authoritative
+        idmap_file = (
+            index_dir
+            / f"{index_name[: -len('.leann')] if index_name.endswith('.leann') else index_name}.ids.txt"
+        )
+        with open(idmap_file, "w", encoding="utf-8") as f:
+            for sid in string_ids:
+                f.write(str(sid) + "\n")
+        logger.info("Wrote %d IDs to %s", len(string_ids), idmap_file)
 
         # Create metadata file
         leann_meta_path = index_dir / f"{index_name}.meta.json"
@@ -635,6 +638,9 @@ class LeannBuilder:
             is_recompute = self.backend_kwargs.get("is_recompute", True)
             meta_data["is_compact"] = is_compact
             meta_data["is_pruned"] = bool(is_recompute)
+
+        # Track total passages for sync/update operations
+        meta_data["total_passages"] = len(self.chunks)
 
         with open(leann_meta_path, "w", encoding="utf-8") as f:
             json.dump(meta_data, f, indent=2)
@@ -761,11 +767,20 @@ class LeannBuilder:
         passage_meta_mode = meta.get("embedding_mode", self.embedding_mode)
         passage_provider_options = meta.get("embedding_options", self.embedding_options)
 
+        # Assign IDs to chunks that don't already have one
+        # Preserve existing IDs (e.g., UUIDs from update_file) to avoid overwrites
         base_id = index.ntotal
         for offset, chunk in enumerate(valid_chunks):
-            new_id = str(base_id + offset)
-            chunk.setdefault("metadata", {})["id"] = new_id
-            chunk["id"] = new_id
+            existing_id = chunk.get("id") or chunk.get("metadata", {}).get("id")
+            if existing_id:
+                # Preserve existing ID (e.g., UUID from update_file)
+                chunk["id"] = existing_id
+                chunk.setdefault("metadata", {})["id"] = existing_id
+            else:
+                # Assign new sequential ID only if no ID exists
+                new_id = str(base_id + offset)
+                chunk.setdefault("metadata", {})["id"] = new_id
+                chunk["id"] = new_id
 
         # Append passages/offsets before we attempt index.add so the ZMQ server
         # can resolve newly assigned IDs during recompute. Keep rollback hooks
@@ -832,6 +847,24 @@ class LeannBuilder:
                 else:
                     index.add(embeddings.shape[0], faiss.swig_ptr(embeddings))
                 faiss.write_index(index, str(index_file))
+
+                # Update IDs file with new chunk IDs
+                # Read existing IDs and append new ones
+                ids_file = (
+                    index_dir
+                    / f"{index_name[: -len('.leann')] if index_name.endswith('.leann') else index_name}.ids.txt"
+                )
+                existing_ids = []
+                if ids_file.exists():
+                    with open(ids_file, encoding="utf-8") as f:
+                        existing_ids = [line.strip() for line in f if line.strip()]
+                # Append new chunk IDs
+                new_ids = [chunk["id"] for chunk in valid_chunks]
+                all_ids = existing_ids + new_ids
+                with open(ids_file, "w", encoding="utf-8") as f:
+                    for id_str in all_ids:
+                        f.write(str(id_str) + "\n")
+                logger.info("Updated IDs file with %d new IDs (total: %d)", len(new_ids), len(all_ids))
             finally:
                 if server_started and server_manager is not None:
                     server_manager.stop_server()
@@ -1064,6 +1097,12 @@ class LeannBuilder:
         builder_instance.build(
             kept_embeddings_array, kept_string_ids, temp_prefix, **backend_kwargs_for_rebuild
         )
+
+        # Explicitly write IDs file - don't rely on backend's error-swallowing code
+        # The backend has silent exception handling that can leave the file incomplete
+        with open(temp_ids_path, "w", encoding="utf-8") as f:
+            for kept_id in kept_string_ids:
+                f.write(str(kept_id) + "\n")
 
         logger.info("Successfully built new index with %d chunks.", len(kept_string_ids))
 

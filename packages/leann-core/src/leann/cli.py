@@ -1564,6 +1564,35 @@ Examples:
         builder.build_index(index_path)
         print(f"Index built at {index_path}")
 
+        # Create hash file for sync operations
+        # Extract unique file paths from chunks and compute their hashes
+        import hashlib
+
+        file_hashes = {}
+        seen_files = set()
+        for chunk in all_texts:
+            file_path = chunk.get("metadata", {}).get("file_path")
+            if file_path and file_path not in seen_files:
+                seen_files.add(file_path)
+                try:
+                    file_path_obj = Path(file_path)
+                    if file_path_obj.exists():
+                        sha256 = hashlib.sha256()
+                        with open(file_path_obj, "rb") as f:
+                            for data in iter(lambda: f.read(8192), b""):
+                                sha256.update(data)
+                        file_hashes[file_path] = sha256.hexdigest()
+                except (OSError, IOError):
+                    pass  # Skip files that can't be read
+
+        if file_hashes:
+            hash_file = index_dir / "documents.leann.file_hashes.json"
+            with open(hash_file, "w", encoding="utf-8") as f:
+                import json
+
+                json.dump(file_hashes, f, indent=2)
+            print(f"Created hash file with {len(file_hashes)} file(s) for sync support")
+
         # Register this project directory in global registry
         self.register_project_dir()
 
