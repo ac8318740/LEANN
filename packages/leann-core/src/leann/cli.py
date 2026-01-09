@@ -86,6 +86,9 @@ Examples:
   leann build my-mixed --docs ./readme.md ./src/ ./config.json           # Build index from mixed files/dirs
   leann build my-ppts --docs ./ --file-types .pptx,.pdf                  # Index only PowerPoint and PDF files
   leann update my-docs --docs ./new-documents                            # Add new documents to existing index
+  leann remove-file my-docs ./src/old_file.py                           # Remove a specific file from index
+  leann update-file my-docs ./src/modified.py                           # Re-index a single modified file
+  leann sync my-docs --docs ./src                                       # Sync index with directory (auto-detect changes)
   leann search my-docs "query"                                           # Search in my-docs index
   leann ask my-docs "question"                                           # Ask my-docs index
   leann list                                                             # List all stored indexes
@@ -424,6 +427,43 @@ Examples:
         remove_parser.add_argument("index_name", help="Index name to remove")
         remove_parser.add_argument(
             "--force", "-f", action="store_true", help="Force removal without confirmation"
+        )
+
+        # Remove file from index
+        remove_file_parser = subparsers.add_parser(
+            "remove-file", help="Remove all chunks from a specific file"
+        )
+        remove_file_parser.add_argument("index_name", help="Index name")
+        remove_file_parser.add_argument("file_path", help="Path to file to remove from index")
+
+        # Update single file in index
+        update_file_parser = subparsers.add_parser(
+            "update-file", help="Re-index a single file (delete old + add new chunks)"
+        )
+        update_file_parser.add_argument("index_name", help="Index name")
+        update_file_parser.add_argument("file_path", help="Path to file to re-index")
+
+        # Sync index with directory
+        sync_parser = subparsers.add_parser(
+            "sync", help="Sync index with directory (detect and apply changes)"
+        )
+        sync_parser.add_argument("index_name", help="Index name")
+        sync_parser.add_argument(
+            "--docs",
+            type=str,
+            required=True,
+            help="Directory to sync with",
+        )
+        sync_parser.add_argument(
+            "--file-types",
+            type=str,
+            help="Comma-separated list of file extensions to include (e.g., '.py,.js')",
+        )
+        sync_parser.add_argument(
+            "--include-hidden",
+            action=argparse.BooleanOptionalAction,
+            default=False,
+            help="Include hidden files",
         )
 
         return parser
@@ -1870,6 +1910,134 @@ Examples:
 
             _ask_once(query)
 
+    def _resolve_index_path(self, index_name: str) -> str:
+        """Resolve index name to full path."""
+        # If it looks like a path, use as-is
+        if "/" in index_name or index_name.endswith(".leann"):
+            return index_name
+        # Otherwise, look in default index directory
+        return str(self.indexes_dir / index_name / "documents.leann")
+
+    async def remove_file_from_index(self, args):
+        """Remove all chunks from a specific file."""
+        print(f"\n🗑️  Removing file from index: {args.file_path}")
+
+        index_path = self._resolve_index_path(args.index_name)
+        file_path = Path(args.file_path).resolve()
+
+        if not Path(index_path + ".meta.json").exists():
+            print(f"❌ Index not found: {args.index_name}")
+            return
+
+        # Load metadata to get backend settings
+        import json
+        with open(index_path + ".meta.json", encoding="utf-8") as f:
+            meta = json.load(f)
+
+        # Create builder with index settings
+        builder = LeannBuilder(
+            backend_name=meta.get("backend_name", "hnsw"),
+            embedding_model=meta.get("embedding_model"),
+            embedding_mode=meta.get("embedding_mode", "sentence-transformers"),
+            embedding_options=meta.get("embedding_options", {}),
+            **meta.get("backend_kwargs", {})
+        )
+
+        try:
+            deleted_count = builder.delete_by_file(index_path, str(file_path))
+            print(f"✅ Removed {deleted_count} chunks from file: {args.file_path}")
+        except ValueError as e:
+            print(f"❌ Cannot remove: {e}")
+        except FileNotFoundError as e:
+            print(f"❌ Not found: {e}")
+
+    async def update_single_file(self, args):
+        """Re-index a single file."""
+        print(f"\n🔄 Updating file in index: {args.file_path}")
+
+        index_path = self._resolve_index_path(args.index_name)
+        file_path = Path(args.file_path).resolve()
+
+        if not Path(index_path + ".meta.json").exists():
+            print(f"❌ Index not found: {args.index_name}")
+            return
+
+        # Load metadata
+        import json
+        with open(index_path + ".meta.json", encoding="utf-8") as f:
+            meta = json.load(f)
+
+        builder = LeannBuilder(
+            backend_name=meta.get("backend_name", "hnsw"),
+            embedding_model=meta.get("embedding_model"),
+            embedding_mode=meta.get("embedding_mode", "sentence-transformers"),
+            embedding_options=meta.get("embedding_options", {}),
+            **meta.get("backend_kwargs", {})
+        )
+
+        try:
+            deleted, added = builder.update_file(index_path, str(file_path))
+            print(f"✅ Updated: deleted {deleted} chunks, added {added} chunks")
+        except ValueError as e:
+            print(f"❌ Cannot update: {e}")
+        except FileNotFoundError as e:
+            print(f"❌ Not found: {e}")
+
+    async def sync_index(self, args):
+        """Sync index with a directory."""
+        print(f"\n🔄 Syncing index '{args.index_name}' with '{args.docs}'")
+
+        index_path = self._resolve_index_path(args.index_name)
+
+        if not Path(index_path + ".meta.json").exists():
+            print(f"❌ Index not found: {args.index_name}")
+            return
+
+        # Load metadata
+        import json
+        with open(index_path + ".meta.json", encoding="utf-8") as f:
+            meta = json.load(f)
+
+        builder = LeannBuilder(
+            backend_name=meta.get("backend_name", "hnsw"),
+            embedding_model=meta.get("embedding_model"),
+            embedding_mode=meta.get("embedding_mode", "sentence-transformers"),
+            embedding_options=meta.get("embedding_options", {}),
+            **meta.get("backend_kwargs", {})
+        )
+
+        # Build file filter if file types specified
+        file_filter = None
+        if args.file_types:
+            extensions = [ext.strip() for ext in args.file_types.split(",")]
+            # Ensure extensions start with dot
+            extensions = [ext if ext.startswith(".") else f".{ext}" for ext in extensions]
+            file_filter = lambda p: any(p.endswith(ext) for ext in extensions)
+
+        # Add hidden files filter
+        if not args.include_hidden:
+            base_filter = file_filter
+            def combined_filter(p):
+                # Skip hidden files/dirs
+                if "/." in p or p.startswith("."):
+                    return False
+                if base_filter:
+                    return base_filter(p)
+                return True
+            file_filter = combined_filter
+
+        try:
+            stats = builder.sync_index(index_path, args.docs, file_filter=file_filter)
+            print(f"\n📊 Sync complete:")
+            print(f"   Added:     {stats['added']} files (+{stats['chunks_added']} chunks)")
+            print(f"   Modified:  {stats['modified']} files")
+            print(f"   Deleted:   {stats['deleted']} files (-{stats['chunks_deleted']} chunks)")
+            print(f"   Unchanged: {stats['unchanged']} files")
+        except ValueError as e:
+            print(f"❌ Cannot sync: {e}")
+        except FileNotFoundError as e:
+            print(f"❌ Not found: {e}")
+
     async def run(self, args=None):
         parser = self.create_parser()
 
@@ -1888,6 +2056,12 @@ Examples:
             await self.build_index(args)
         elif args.command == "update":
             await self.update_index(args)
+        elif args.command == "remove-file":
+            await self.remove_file_from_index(args)
+        elif args.command == "update-file":
+            await self.update_single_file(args)
+        elif args.command == "sync":
+            await self.sync_index(args)
         elif args.command == "search":
             await self.search_documents(args)
         elif args.command == "ask":
