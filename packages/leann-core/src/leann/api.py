@@ -1051,17 +1051,18 @@ class LeannBuilder:
             raise ValueError(f"Backend '{backend_name}' not found in registry.")
 
         # Build new index to temporary location first
-        # The build() method writes to index_file and also creates a .ids.txt file
-        # based on the index_path stem (see hnsw_backend.py lines 94-100)
-        temp_index_path = str(index_file) + ".rebuild.tmp"
-        # The backend's build() creates IDs file as: index_dir / f"{Path(index_path).stem}.ids.txt"
-        # With temp_index_path = "myindex.index.rebuild.tmp", stem = "myindex.index.rebuild"
-        # So backend creates: "myindex.index.rebuild.ids.txt"
-        temp_ids_path = index_dir / f"{Path(temp_index_path).stem}.ids.txt"
+        # The backend's build() uses Path(index_path).stem to get the prefix, then appends .index/.ids.txt
+        # Path.stem only removes the LAST extension, so:
+        #   - If we pass "documents.index.rebuild", stem = "documents.index"
+        #   - Backend creates: "documents.index.index" and "documents.index.ids.txt"
+        # We use "_rebuild" (underscore) to avoid the stem stripping issue
+        temp_prefix = str(index_file).replace(".index", "_rebuild")
+        temp_index_actual = index_dir / f"{Path(temp_prefix).stem}.index"
+        temp_ids_path = index_dir / f"{Path(temp_prefix).stem}.ids.txt"
 
         builder_instance = backend_factory.builder(**backend_kwargs_for_rebuild)
         builder_instance.build(
-            kept_embeddings_array, kept_string_ids, temp_index_path, **backend_kwargs_for_rebuild
+            kept_embeddings_array, kept_string_ids, temp_prefix, **backend_kwargs_for_rebuild
         )
 
         logger.info("Successfully built new index with %d chunks.", len(kept_string_ids))
@@ -1087,8 +1088,8 @@ class LeannBuilder:
 
             # Atomic renames to replace original files
             # First rename index and IDs files (these were built to temp location)
-            Path(temp_index_path).replace(index_file)
-            Path(temp_ids_path).replace(ids_file)
+            temp_index_actual.replace(index_file)
+            temp_ids_path.replace(ids_file)
 
             # Then rename passages files
             passages_file_tmp.replace(passages_file)
@@ -1096,7 +1097,7 @@ class LeannBuilder:
 
         except Exception as e:
             # Cleanup temp files on failure
-            for tmp_file in [passages_file_tmp, offset_file_tmp, Path(temp_index_path), Path(temp_ids_path)]:
+            for tmp_file in [passages_file_tmp, offset_file_tmp, temp_index_actual, temp_ids_path]:
                 if tmp_file.exists():
                     tmp_file.unlink()
             raise RuntimeError(f"Failed to rewrite index files: {e}") from e
@@ -1231,22 +1232,25 @@ class LeannBuilder:
             paragraph_separator="\n\n",
         )
 
+        import uuid
+
         new_chunks: list[dict[str, Any]] = []
         for doc in documents:
-            # Preserve file metadata
-            chunk_metadata = {
-                "file_path": str(file_path_obj.resolve()),
-                "file_name": file_path_obj.name,
-            }
-
-            # Add optional metadata if available
-            if "creation_date" in doc.metadata:
-                chunk_metadata["creation_date"] = doc.metadata["creation_date"]
-            if "last_modified_date" in doc.metadata:
-                chunk_metadata["last_modified_date"] = doc.metadata["last_modified_date"]
-
             nodes = node_parser.get_nodes_from_documents([doc])
             for node in nodes:
+                # Generate unique ID for each chunk to avoid conflicts with existing chunks
+                chunk_metadata = {
+                    "id": str(uuid.uuid4()),
+                    "file_path": str(file_path_obj.resolve()),
+                    "file_name": file_path_obj.name,
+                }
+
+                # Add optional metadata if available
+                if "creation_date" in doc.metadata:
+                    chunk_metadata["creation_date"] = doc.metadata["creation_date"]
+                if "last_modified_date" in doc.metadata:
+                    chunk_metadata["last_modified_date"] = doc.metadata["last_modified_date"]
+
                 new_chunks.append({"text": node.get_content(), "metadata": chunk_metadata})
 
         if not new_chunks:
