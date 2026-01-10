@@ -1331,11 +1331,11 @@ class LeannBuilder:
     def sync_index(
         self,
         index_path: str,
-        docs_path: str,
+        docs_path: Union[str, list[str]],
         file_filter: Optional[Callable[[str], bool]] = None,
     ) -> dict[str, int]:
         """
-        Sync an index with a directory, detecting and handling file changes.
+        Sync an index with one or more directories, detecting and handling file changes.
 
         Uses content hashes to detect:
         - New files: Added to index
@@ -1349,7 +1349,7 @@ class LeannBuilder:
 
         Args:
             index_path: Path to the LEANN index
-            docs_path: Path to the directory to sync
+            docs_path: Path to directory (or list of directories) to sync
             file_filter: Optional function to filter files (returns True to include).
                         Applied to absolute file paths.
 
@@ -1402,40 +1402,47 @@ class LeannBuilder:
         else:
             old_hashes = {}
 
-        logger.info("Syncing index '%s' with directory '%s'", index_path, docs_path)
+        # Normalize docs_path to a list
+        if isinstance(docs_path, str):
+            docs_paths = [docs_path]
+        else:
+            docs_paths = docs_path
+
+        logger.info("Syncing index '%s' with %d director%s", index_path, len(docs_paths), "y" if len(docs_paths) == 1 else "ies")
         if old_hashes:
             logger.info("Loaded %d file hashes from previous sync", len(old_hashes))
         else:
             logger.info("First sync - treating all files as new")
 
-        # 3. Scan current directory and compute new hashes
-        docs_dir = Path(docs_path)
-        if not docs_dir.exists():
-            raise FileNotFoundError(f"Directory not found: {docs_path}")
-        if not docs_dir.is_dir():
-            raise ValueError(f"Not a directory: {docs_path}")
-
+        # 3. Scan ALL directories and compute new hashes
         new_hashes: dict[str, str] = {}
-        logger.info("Scanning directory and computing file hashes...")
+        logger.info("Scanning %d director%s and computing file hashes...", len(docs_paths), "y" if len(docs_paths) == 1 else "ies")
 
-        for file_path in docs_dir.rglob("*"):
-            if not file_path.is_file():
-                continue
+        for docs_path_item in docs_paths:
+            docs_dir = Path(docs_path_item)
+            if not docs_dir.exists():
+                raise FileNotFoundError(f"Directory not found: {docs_path_item}")
+            if not docs_dir.is_dir():
+                raise ValueError(f"Not a directory: {docs_path_item}")
 
-            abs_path = str(file_path.resolve())
+            for file_path in docs_dir.rglob("*"):
+                if not file_path.is_file():
+                    continue
 
-            # Apply file filter if provided
-            if file_filter and not file_filter(abs_path):
-                continue
+                abs_path = str(file_path.resolve())
 
-            try:
-                file_hash = self._compute_file_hash(file_path)
-                new_hashes[abs_path] = file_hash
-            except (OSError, IOError) as e:
-                logger.warning("Failed to read file '%s': %s. Skipping.", abs_path, e)
-                continue
+                # Apply file filter if provided
+                if file_filter and not file_filter(abs_path):
+                    continue
 
-        logger.info("Found %d files in directory", len(new_hashes))
+                try:
+                    file_hash = self._compute_file_hash(file_path)
+                    new_hashes[abs_path] = file_hash
+                except (OSError, IOError) as e:
+                    logger.warning("Failed to read file '%s': %s. Skipping.", abs_path, e)
+                    continue
+
+        logger.info("Found %d files across all directories", len(new_hashes))
 
         # 4. Categorize files
         old_files = set(old_hashes.keys())

@@ -2059,29 +2059,18 @@ Examples:
                 return True
             file_filter = combined_filter
 
-        # Aggregate stats across all directories
-        total_stats = {
-            "added": 0,
-            "modified": 0,
-            "deleted": 0,
-            "unchanged": 0,
-            "chunks_added": 0,
-            "chunks_deleted": 0,
-        }
-
         try:
-            for docs_path in docs_paths:
-                if num_dirs > 1:
-                    print(f"   📁 Syncing: {docs_path}")
-                stats = builder.sync_index(index_path, docs_path, file_filter=file_filter)
-                for key in total_stats:
-                    total_stats[key] += stats[key]
+            # Pass all directories at once - API scans all before comparing
+            if num_dirs > 1:
+                for docs_path in docs_paths:
+                    print(f"   📁 {docs_path}")
+            stats = builder.sync_index(index_path, docs_paths, file_filter=file_filter)
 
             print(f"\n📊 Sync complete:")
-            print(f"   Added:     {total_stats['added']} files (+{total_stats['chunks_added']} chunks)")
-            print(f"   Modified:  {total_stats['modified']} files")
-            print(f"   Deleted:   {total_stats['deleted']} files (-{total_stats['chunks_deleted']} chunks)")
-            print(f"   Unchanged: {total_stats['unchanged']} files")
+            print(f"   Added:     {stats['added']} files (+{stats['chunks_added']} chunks)")
+            print(f"   Modified:  {stats['modified']} files")
+            print(f"   Deleted:   {stats['deleted']} files (-{stats['chunks_deleted']} chunks)")
+            print(f"   Unchanged: {stats['unchanged']} files")
         except ValueError as e:
             print(f"❌ Cannot sync: {e}")
         except FileNotFoundError as e:
