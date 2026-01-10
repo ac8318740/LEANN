@@ -88,7 +88,7 @@ Examples:
   leann update my-docs --docs ./new-documents                            # Add new documents to existing index
   leann remove-file my-docs ./src/old_file.py                           # Remove a specific file from index
   leann update-file my-docs ./src/modified.py                           # Re-index a single modified file
-  leann sync my-docs --docs ./src                                       # Sync index with directory (auto-detect changes)
+  leann sync my-docs --docs ./src ./tests                               # Sync index with directories (auto-detect changes)
   leann search my-docs "query"                                           # Search in my-docs index
   leann ask my-docs "question"                                           # Ask my-docs index
   leann list                                                             # List all stored indexes
@@ -445,14 +445,15 @@ Examples:
 
         # Sync index with directory
         sync_parser = subparsers.add_parser(
-            "sync", help="Sync index with directory (detect and apply changes)"
+            "sync", help="Sync index with directories (detect and apply changes)"
         )
         sync_parser.add_argument("index_name", help="Index name")
         sync_parser.add_argument(
             "--docs",
             type=str,
+            nargs="+",
             required=True,
-            help="Directory to sync with",
+            help="Directories to sync with (one or more)",
         )
         sync_parser.add_argument(
             "--file-types",
@@ -2013,8 +2014,11 @@ Examples:
             print(f"❌ Not found: {e}")
 
     async def sync_index(self, args):
-        """Sync index with a directory."""
-        print(f"\n🔄 Syncing index '{args.index_name}' with '{args.docs}'")
+        """Sync index with one or more directories."""
+        docs_paths = args.docs
+        num_dirs = len(docs_paths)
+        dirs_label = "directory" if num_dirs == 1 else "directories"
+        print(f"\n🔄 Syncing index '{args.index_name}' with {num_dirs} {dirs_label}")
 
         index_path = self._resolve_index_path(args.index_name)
 
@@ -2055,13 +2059,29 @@ Examples:
                 return True
             file_filter = combined_filter
 
+        # Aggregate stats across all directories
+        total_stats = {
+            "added": 0,
+            "modified": 0,
+            "deleted": 0,
+            "unchanged": 0,
+            "chunks_added": 0,
+            "chunks_deleted": 0,
+        }
+
         try:
-            stats = builder.sync_index(index_path, args.docs, file_filter=file_filter)
+            for docs_path in docs_paths:
+                if num_dirs > 1:
+                    print(f"   📁 Syncing: {docs_path}")
+                stats = builder.sync_index(index_path, docs_path, file_filter=file_filter)
+                for key in total_stats:
+                    total_stats[key] += stats[key]
+
             print(f"\n📊 Sync complete:")
-            print(f"   Added:     {stats['added']} files (+{stats['chunks_added']} chunks)")
-            print(f"   Modified:  {stats['modified']} files")
-            print(f"   Deleted:   {stats['deleted']} files (-{stats['chunks_deleted']} chunks)")
-            print(f"   Unchanged: {stats['unchanged']} files")
+            print(f"   Added:     {total_stats['added']} files (+{total_stats['chunks_added']} chunks)")
+            print(f"   Modified:  {total_stats['modified']} files")
+            print(f"   Deleted:   {total_stats['deleted']} files (-{total_stats['chunks_deleted']} chunks)")
+            print(f"   Unchanged: {total_stats['unchanged']} files")
         except ValueError as e:
             print(f"❌ Cannot sync: {e}")
         except FileNotFoundError as e:
