@@ -122,6 +122,10 @@ Examples:
   leann build my-files --docs ./file1.py ./file2.txt ./docs/             # Build index from files and directories
   leann build my-mixed --docs ./readme.md ./src/ ./config.json           # Build index from mixed files/dirs
   leann build my-ppts --docs ./ --file-types .pptx,.pdf                  # Index only PowerPoint and PDF files
+  leann update my-docs --docs ./new-documents                            # Add new documents to existing index
+  leann remove-file my-docs ./src/old_file.py                           # Remove a specific file from index
+  leann update-file my-docs ./src/modified.py                           # Re-index a single modified file
+  leann sync my-docs --docs ./src ./tests                               # Sync index with directories (auto-detect changes)
   leann search my-docs "query"                                           # Search in my-docs index
   leann ask my-docs "question"                                           # Ask my-docs index
   leann list                                                             # List all stored indexes
@@ -289,6 +293,77 @@ Examples:
             help="Fall back to traditional chunking if AST chunking fails (default: True)",
         )
 
+        # Update command
+        update_parser = subparsers.add_parser(
+            "update", help="Update existing index with new documents"
+        )
+        update_parser.add_argument("index_name", help="Index name to update")
+        update_parser.add_argument(
+            "--docs",
+            type=str,
+            nargs="+",
+            required=True,
+            help="New documents directories and/or files to add",
+        )
+        update_parser.add_argument(
+            "--file-types",
+            type=str,
+            help="Comma-separated list of file extensions to include (e.g., '.txt,.pdf,.pptx'). If not specified, uses default supported types.",
+        )
+        update_parser.add_argument(
+            "--include-hidden",
+            action=argparse.BooleanOptionalAction,
+            default=False,
+            help="Include hidden files and directories (paths starting with '.') during indexing (default: false)",
+        )
+        update_parser.add_argument(
+            "--doc-chunk-size",
+            type=int,
+            default=256,
+            help="Document chunk size in TOKENS (default: 256). Should match original build settings for consistency.",
+        )
+        update_parser.add_argument(
+            "--doc-chunk-overlap",
+            type=int,
+            default=128,
+            help="Document chunk overlap in TOKENS (default: 128). Should match original build settings for consistency.",
+        )
+        update_parser.add_argument(
+            "--code-chunk-size",
+            type=int,
+            default=512,
+            help="Code chunk size in TOKENS (default: 512). Should match original build settings for consistency.",
+        )
+        update_parser.add_argument(
+            "--code-chunk-overlap",
+            type=int,
+            default=50,
+            help="Code chunk overlap in TOKENS (default: 50). Should match original build settings for consistency.",
+        )
+        update_parser.add_argument(
+            "--use-ast-chunking",
+            action="store_true",
+            help="Enable AST-aware chunking for code files (requires astchunk)",
+        )
+        update_parser.add_argument(
+            "--ast-chunk-size",
+            type=int,
+            default=300,
+            help="AST chunk size in CHARACTERS (non-whitespace) (default: 300).",
+        )
+        update_parser.add_argument(
+            "--ast-chunk-overlap",
+            type=int,
+            default=64,
+            help="AST chunk overlap in CHARACTERS (default: 64).",
+        )
+        update_parser.add_argument(
+            "--ast-fallback-traditional",
+            action="store_true",
+            default=True,
+            help="Fall back to traditional chunking if AST chunking fails (default: True)",
+        )
+
         # Search command
         search_parser = subparsers.add_parser("search", help="Search documents")
         search_parser.add_argument("index_name", help="Index name")
@@ -404,6 +479,44 @@ Examples:
         remove_parser.add_argument("index_name", help="Index name to remove")
         remove_parser.add_argument(
             "--force", "-f", action="store_true", help="Force removal without confirmation"
+        )
+
+        # Remove file from index
+        remove_file_parser = subparsers.add_parser(
+            "remove-file", help="Remove all chunks from a specific file"
+        )
+        remove_file_parser.add_argument("index_name", help="Index name")
+        remove_file_parser.add_argument("file_path", help="Path to file to remove from index")
+
+        # Update single file in index
+        update_file_parser = subparsers.add_parser(
+            "update-file", help="Re-index a single file (delete old + add new chunks)"
+        )
+        update_file_parser.add_argument("index_name", help="Index name")
+        update_file_parser.add_argument("file_path", help="Path to file to re-index")
+
+        # Sync index with directory
+        sync_parser = subparsers.add_parser(
+            "sync", help="Sync index with directories (detect and apply changes)"
+        )
+        sync_parser.add_argument("index_name", help="Index name")
+        sync_parser.add_argument(
+            "--docs",
+            type=str,
+            nargs="+",
+            required=True,
+            help="Directories to sync with (one or more)",
+        )
+        sync_parser.add_argument(
+            "--file-types",
+            type=str,
+            help="Comma-separated list of file extensions to include (e.g., '.py,.js')",
+        )
+        sync_parser.add_argument(
+            "--include-hidden",
+            action=argparse.BooleanOptionalAction,
+            default=False,
+            help="Include hidden files",
         )
 
         return parser
@@ -1504,8 +1617,178 @@ Examples:
         builder.build_index(index_path)
         print(f"Index built at {index_path}")
 
+        # Create hash file for sync operations
+        # Extract unique file paths from chunks and compute their hashes
+        import hashlib
+
+        file_hashes = {}
+        seen_files = set()
+        for chunk in all_texts:
+            file_path = chunk.get("metadata", {}).get("file_path")
+            if file_path and file_path not in seen_files:
+                seen_files.add(file_path)
+                try:
+                    file_path_obj = Path(file_path)
+                    if file_path_obj.exists():
+                        sha256 = hashlib.sha256()
+                        with open(file_path_obj, "rb") as f:
+                            for data in iter(lambda: f.read(8192), b""):
+                                sha256.update(data)
+                        file_hashes[file_path] = sha256.hexdigest()
+                except (OSError, IOError):
+                    pass  # Skip files that can't be read
+
+        if file_hashes:
+            hash_file = index_dir / "documents.leann.file_hashes.json"
+            with open(hash_file, "w", encoding="utf-8") as f:
+                import json
+
+                json.dump(file_hashes, f, indent=2)
+            print(f"Created hash file with {len(file_hashes)} file(s) for sync support")
+
         # Register this project directory in global registry
         self.register_project_dir()
+
+    async def update_index(self, args):
+        """Update an existing index with new documents."""
+        index_name = args.index_name
+        docs_paths = args.docs
+
+        # Check if index exists
+        if not self.index_exists(index_name):
+            print(f"❌ Index '{index_name}' not found.")
+            print(f"   Use 'leann build {index_name} --docs <dir>' to create it first.")
+            return
+
+        index_dir = self.indexes_dir / index_name
+        index_path = self.get_index_path(index_name)
+        meta_path = index_dir / "documents.leann.meta.json"
+
+        # Load and validate metadata
+        print(f"📋 Loading index metadata for '{index_name}'...")
+        try:
+            import json
+
+            with open(meta_path, encoding="utf-8") as f:
+                meta = json.load(f)
+        except Exception as e:
+            print(f"❌ Error reading index metadata: {e}")
+            return
+
+        # Validate backend is HNSW
+        backend_name = meta.get("backend_name")
+        if backend_name != "hnsw":
+            print(f"❌ Cannot update: Index uses '{backend_name}' backend.")
+            print("   Only HNSW indices support updates.")
+            return
+
+        # Validate index is not compact
+        meta_backend_kwargs = meta.get("backend_kwargs", {})
+        is_compact = meta.get("is_compact", meta_backend_kwargs.get("is_compact", True))
+        if is_compact:
+            print("❌ Cannot update: Index is compact.")
+            print("   Compact HNSW indices do not support in-place updates.")
+            print(f"   Rebuild with: leann build {index_name} --docs <dir> --no-compact --force")
+            return
+
+        # Extract embedding configuration from metadata
+        embedding_model = meta.get("embedding_model")
+        embedding_mode = meta.get("embedding_mode")
+        embedding_options = meta.get("embedding_options", {})
+        graph_degree = meta_backend_kwargs.get("graph_degree", 32)
+        complexity = meta_backend_kwargs.get("complexity", 64)
+        is_recompute = meta.get("is_pruned") or meta_backend_kwargs.get("is_recompute", True)
+        num_threads = meta_backend_kwargs.get("num_threads", 1)
+
+        print("✅ Index configuration:")
+        print(f"   Backend: {backend_name}")
+        print(f"   Embedding model: {embedding_model}")
+        print(f"   Embedding mode: {embedding_mode}")
+        print(f"   Is compact: {is_compact}")
+        print(f"   Is recompute: {is_recompute}")
+
+        # Display paths being added
+        files = [p for p in docs_paths if Path(p).is_file()]
+        directories = [p for p in docs_paths if Path(p).is_dir()]
+
+        print(f"\n📂 Adding {len(docs_paths)} path{'s' if len(docs_paths) > 1 else ''}:")
+        if files:
+            print(f"  📄 Files ({len(files)}):")
+            for i, file_path in enumerate(files, 1):
+                print(f"    {i}. {Path(file_path).resolve()}")
+        if directories:
+            print(f"  📁 Directories ({len(directories)}):")
+            for i, dir_path in enumerate(directories, 1):
+                print(f"    {i}. {Path(dir_path).resolve()}")
+
+        # Configure chunking based on CLI args
+        doc_chunk_size = max(1, int(args.doc_chunk_size))
+        doc_chunk_overlap = max(0, int(args.doc_chunk_overlap))
+        if doc_chunk_overlap >= doc_chunk_size:
+            print(
+                f"⚠️  Adjusting doc chunk overlap from {doc_chunk_overlap} to {doc_chunk_size - 1} (must be < chunk size)"
+            )
+            doc_chunk_overlap = doc_chunk_size - 1
+
+        code_chunk_size = max(1, int(args.code_chunk_size))
+        code_chunk_overlap = max(0, int(args.code_chunk_overlap))
+        if code_chunk_overlap >= code_chunk_size:
+            print(
+                f"⚠️  Adjusting code chunk overlap from {code_chunk_overlap} to {code_chunk_size - 1} (must be < chunk size)"
+            )
+            code_chunk_overlap = code_chunk_size - 1
+
+        self.node_parser = SentenceSplitter(
+            chunk_size=doc_chunk_size,
+            chunk_overlap=doc_chunk_overlap,
+            separator=" ",
+            paragraph_separator="\n\n",
+        )
+        self.code_parser = SentenceSplitter(
+            chunk_size=code_chunk_size,
+            chunk_overlap=code_chunk_overlap,
+            separator="\n",
+            paragraph_separator="\n\n",
+        )
+
+        # Load new documents
+        print("\n🔄 Loading new documents...")
+        all_texts = self.load_documents(
+            docs_paths, args.file_types, include_hidden=args.include_hidden, args=args
+        )
+        if not all_texts:
+            print("❌ No new documents found to add")
+            return
+
+        print(f"✅ Loaded {len(all_texts)} new chunks")
+
+        # Initialize builder with settings from existing index
+        print(f"\n🔨 Updating index '{index_name}'...")
+        builder = LeannBuilder(
+            backend_name=backend_name,
+            embedding_model=embedding_model,
+            embedding_mode=embedding_mode,
+            embedding_options=embedding_options or None,
+            graph_degree=graph_degree,
+            complexity=complexity,
+            is_compact=is_compact,
+            is_recompute=is_recompute,
+            num_threads=num_threads,
+        )
+
+        # Add new texts to builder
+        for chunk in all_texts:
+            builder.add_text(chunk["text"], metadata=chunk["metadata"])
+
+        # Call update_index instead of build_index
+        try:
+            builder.update_index(index_path)
+            print(f"✅ Index updated successfully at {index_path}")
+            print(f"   Added {len(all_texts)} new chunks to '{index_name}'")
+        except ValueError as e:
+            print(f"❌ Update failed: {e}")
+        except Exception as e:
+            print(f"❌ Unexpected error during update: {e}")
 
     async def search_documents(self, args):
         index_name = args.index_name
@@ -1715,6 +1998,144 @@ Examples:
 
             _ask_once(query)
 
+    def _resolve_index_path(self, index_name: str) -> str:
+        """Resolve index name to full path."""
+        # If it looks like a path, use as-is
+        if "/" in index_name or index_name.endswith(".leann"):
+            return index_name
+        # Otherwise, look in default index directory
+        return str(self.indexes_dir / index_name / "documents.leann")
+
+    async def remove_file_from_index(self, args):
+        """Remove all chunks from a specific file."""
+        print(f"\n🗑️  Removing file from index: {args.file_path}")
+
+        index_path = self._resolve_index_path(args.index_name)
+        file_path = Path(args.file_path).resolve()
+
+        if not Path(index_path + ".meta.json").exists():
+            print(f"❌ Index not found: {args.index_name}")
+            return
+
+        # Load metadata to get backend settings
+        import json
+        with open(index_path + ".meta.json", encoding="utf-8") as f:
+            meta = json.load(f)
+
+        # Create builder with index settings
+        builder = LeannBuilder(
+            backend_name=meta.get("backend_name", "hnsw"),
+            embedding_model=meta.get("embedding_model"),
+            embedding_mode=meta.get("embedding_mode", "sentence-transformers"),
+            embedding_options=meta.get("embedding_options", {}),
+            **meta.get("backend_kwargs", {})
+        )
+
+        try:
+            deleted_count = builder.delete_by_file(index_path, str(file_path))
+            print(f"✅ Removed {deleted_count} chunks from file: {args.file_path}")
+        except ValueError as e:
+            print(f"❌ Cannot remove: {e}")
+        except FileNotFoundError as e:
+            print(f"❌ Not found: {e}")
+
+    async def update_single_file(self, args):
+        """Re-index a single file."""
+        print(f"\n🔄 Updating file in index: {args.file_path}")
+
+        index_path = self._resolve_index_path(args.index_name)
+        file_path = Path(args.file_path).resolve()
+
+        if not Path(index_path + ".meta.json").exists():
+            print(f"❌ Index not found: {args.index_name}")
+            return
+
+        # Load metadata
+        import json
+        with open(index_path + ".meta.json", encoding="utf-8") as f:
+            meta = json.load(f)
+
+        builder = LeannBuilder(
+            backend_name=meta.get("backend_name", "hnsw"),
+            embedding_model=meta.get("embedding_model"),
+            embedding_mode=meta.get("embedding_mode", "sentence-transformers"),
+            embedding_options=meta.get("embedding_options", {}),
+            **meta.get("backend_kwargs", {})
+        )
+
+        try:
+            deleted, added = builder.update_file(index_path, str(file_path))
+            print(f"✅ Updated: deleted {deleted} chunks, added {added} chunks")
+        except ValueError as e:
+            print(f"❌ Cannot update: {e}")
+        except FileNotFoundError as e:
+            print(f"❌ Not found: {e}")
+
+    async def sync_index(self, args):
+        """Sync index with one or more directories."""
+        docs_paths = args.docs
+        num_dirs = len(docs_paths)
+        dirs_label = "directory" if num_dirs == 1 else "directories"
+        print(f"\n🔄 Syncing index '{args.index_name}' with {num_dirs} {dirs_label}")
+
+        index_path = self._resolve_index_path(args.index_name)
+
+        if not Path(index_path + ".meta.json").exists():
+            print(f"❌ Index not found: {args.index_name}")
+            return
+
+        # Load metadata
+        import json
+        with open(index_path + ".meta.json", encoding="utf-8") as f:
+            meta = json.load(f)
+
+        builder = LeannBuilder(
+            backend_name=meta.get("backend_name", "hnsw"),
+            embedding_model=meta.get("embedding_model"),
+            embedding_mode=meta.get("embedding_mode", "sentence-transformers"),
+            embedding_options=meta.get("embedding_options", {}),
+            **meta.get("backend_kwargs", {})
+        )
+
+        # Build file filter if file types specified
+        file_filter = None
+        if args.file_types:
+            extensions = [ext.strip() for ext in args.file_types.split(",")]
+            # Ensure extensions start with dot
+            extensions = [ext if ext.startswith(".") else f".{ext}" for ext in extensions]
+            file_filter = lambda p: any(p.endswith(ext) for ext in extensions)
+
+        # Add hidden files filter
+        if not args.include_hidden:
+            base_filter = file_filter
+            def combined_filter(p):
+                # Skip hidden files/dirs
+                if "/." in p or p.startswith("."):
+                    return False
+                if base_filter:
+                    return base_filter(p)
+                return True
+            file_filter = combined_filter
+
+        try:
+            # Pass all directories at once - API scans all before comparing
+            if num_dirs > 1:
+                for docs_path in docs_paths:
+                    print(f"   📁 {docs_path}")
+            stats = builder.sync_index(index_path, docs_paths, file_filter=file_filter)
+
+            print(f"\n📊 Sync complete:")
+            print(f"   Added:     {stats['added']} files (+{stats['chunks_added']} chunks)")
+            print(f"   Modified:  {stats['modified']} files")
+            print(f"   Deleted:   {stats['deleted']} files (-{stats['chunks_deleted']} chunks)")
+            print(f"   Unchanged: {stats['unchanged']} files")
+            if stats.get("skipped"):
+                print(f"   ⚠️  Skipped: {stats['skipped']} files (see logs for details)")
+        except ValueError as e:
+            print(f"❌ Cannot sync: {e}")
+        except FileNotFoundError as e:
+            print(f"❌ Not found: {e}")
+
     async def run(self, args=None):
         parser = self.create_parser()
 
@@ -1736,6 +2157,14 @@ Examples:
         elif args.command == "build":
             with suppress_cpp_output(suppress):
                 await self.build_index(args)
+        elif args.command == "update":
+            await self.update_index(args)
+        elif args.command == "remove-file":
+            await self.remove_file_from_index(args)
+        elif args.command == "update-file":
+            await self.update_single_file(args)
+        elif args.command == "sync":
+            await self.sync_index(args)
         elif args.command == "search":
             with suppress_cpp_output(suppress):
                 await self.search_documents(args)

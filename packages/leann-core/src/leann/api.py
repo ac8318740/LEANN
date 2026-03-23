@@ -13,7 +13,7 @@ import time
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal, Optional, Union
+from typing import Any, Callable, Literal, Optional, Union
 
 import numpy as np
 from leann_backend_hnsw.convert_to_csr import prune_hnsw_embeddings_inplace
@@ -457,20 +457,20 @@ class LeannBuilder:
             provider_options=self.embedding_options,
         )
         string_ids = [chunk["id"] for chunk in self.chunks]
-        # Persist ID map alongside index so backends that return integer labels can remap to passage IDs
-        try:
-            idmap_file = (
-                index_dir
-                / f"{index_name[: -len('.leann')] if index_name.endswith('.leann') else index_name}.ids.txt"
-            )
-            with open(idmap_file, "w", encoding="utf-8") as f:
-                for sid in string_ids:
-                    f.write(str(sid) + "\n")
-        except Exception:
-            pass
         current_backend_kwargs = {**self.backend_kwargs, "dimensions": self.dimensions}
         builder_instance = self.backend_factory.builder(**current_backend_kwargs)
         builder_instance.build(embeddings, string_ids, index_path, **current_backend_kwargs)
+
+        # Persist ID map AFTER backend.build() to ensure it's authoritative
+        # The backend may also write this file, but we overwrite with the correct data
+        idmap_file = (
+            index_dir
+            / f"{index_name[: -len('.leann')] if index_name.endswith('.leann') else index_name}.ids.txt"
+        )
+        with open(idmap_file, "w", encoding="utf-8") as f:
+            for sid in string_ids:
+                f.write(str(sid) + "\n")
+        logger.info("Wrote %d IDs to %s", len(string_ids), idmap_file)
         leann_meta_path = index_dir / f"{index_name}.meta.json"
         meta_data = {
             "version": "1.0",
@@ -501,6 +501,10 @@ class LeannBuilder:
             is_recompute = self.backend_kwargs.get("is_recompute", True)
             meta_data["is_compact"] = is_compact
             meta_data["is_pruned"] = bool(is_recompute)
+
+        # Track total passages for sync/update operations
+        meta_data["total_passages"] = len(self.chunks)
+
         with open(leann_meta_path, "w", encoding="utf-8") as f:
             json.dump(meta_data, f, indent=2)
 
@@ -587,20 +591,19 @@ class LeannBuilder:
 
         # Build the vector index using precomputed embeddings
         string_ids = [str(id_val) for id_val in ids]
-        # Persist ID map (order == embeddings order)
-        try:
-            idmap_file = (
-                index_dir
-                / f"{index_name[: -len('.leann')] if index_name.endswith('.leann') else index_name}.ids.txt"
-            )
-            with open(idmap_file, "w", encoding="utf-8") as f:
-                for sid in string_ids:
-                    f.write(str(sid) + "\n")
-        except Exception:
-            pass
         current_backend_kwargs = {**self.backend_kwargs, "dimensions": self.dimensions}
         builder_instance = self.backend_factory.builder(**current_backend_kwargs)
         builder_instance.build(embeddings, string_ids, index_path)
+
+        # Persist ID map AFTER backend.build() to ensure it's authoritative
+        idmap_file = (
+            index_dir
+            / f"{index_name[: -len('.leann')] if index_name.endswith('.leann') else index_name}.ids.txt"
+        )
+        with open(idmap_file, "w", encoding="utf-8") as f:
+            for sid in string_ids:
+                f.write(str(sid) + "\n")
+        logger.info("Wrote %d IDs to %s", len(string_ids), idmap_file)
 
         # Create metadata file
         leann_meta_path = index_dir / f"{index_name}.meta.json"
@@ -635,6 +638,9 @@ class LeannBuilder:
             is_recompute = self.backend_kwargs.get("is_recompute", True)
             meta_data["is_compact"] = is_compact
             meta_data["is_pruned"] = bool(is_recompute)
+
+        # Track total passages for sync/update operations
+        meta_data["total_passages"] = len(self.chunks)
 
         with open(leann_meta_path, "w", encoding="utf-8") as f:
             json.dump(meta_data, f, indent=2)
@@ -761,11 +767,20 @@ class LeannBuilder:
         passage_meta_mode = meta.get("embedding_mode", self.embedding_mode)
         passage_provider_options = meta.get("embedding_options", self.embedding_options)
 
+        # Assign IDs to chunks that don't already have one
+        # Preserve existing IDs (e.g., UUIDs from update_file) to avoid overwrites
         base_id = index.ntotal
         for offset, chunk in enumerate(valid_chunks):
-            new_id = str(base_id + offset)
-            chunk.setdefault("metadata", {})["id"] = new_id
-            chunk["id"] = new_id
+            existing_id = chunk.get("id") or chunk.get("metadata", {}).get("id")
+            if existing_id:
+                # Preserve existing ID (e.g., UUID from update_file)
+                chunk["id"] = existing_id
+                chunk.setdefault("metadata", {})["id"] = existing_id
+            else:
+                # Assign new sequential ID only if no ID exists
+                new_id = str(base_id + offset)
+                chunk.setdefault("metadata", {})["id"] = new_id
+                chunk["id"] = new_id
 
         # Append passages/offsets before we attempt index.add so the ZMQ server
         # can resolve newly assigned IDs during recompute. Keep rollback hooks
@@ -832,6 +847,24 @@ class LeannBuilder:
                 else:
                     index.add(embeddings.shape[0], faiss.swig_ptr(embeddings))
                 faiss.write_index(index, str(index_file))
+
+                # Update IDs file with new chunk IDs
+                # Read existing IDs and append new ones
+                ids_file = (
+                    index_dir
+                    / f"{index_name[: -len('.leann')] if index_name.endswith('.leann') else index_name}.ids.txt"
+                )
+                existing_ids = []
+                if ids_file.exists():
+                    with open(ids_file, encoding="utf-8") as f:
+                        existing_ids = [line.strip() for line in f if line.strip()]
+                # Append new chunk IDs
+                new_ids = [chunk["id"] for chunk in valid_chunks]
+                all_ids = existing_ids + new_ids
+                with open(ids_file, "w", encoding="utf-8") as f:
+                    for id_str in all_ids:
+                        f.write(str(id_str) + "\n")
+                logger.info("Updated IDs file with %d new IDs (total: %d)", len(new_ids), len(all_ids))
             finally:
                 if server_started and server_manager is not None:
                     server_manager.stop_server()
@@ -861,6 +894,686 @@ class LeannBuilder:
 
         if needs_recompute:
             prune_hnsw_embeddings_inplace(str(index_file))
+
+    def delete_by_file(self, index_path: str, file_path: str) -> int:
+        """
+        Remove all chunks originating from a specific file by rebuilding the index.
+
+        Since FAISS HNSW doesn't support in-place deletion, this method rebuilds
+        the index with only the chunks that should be kept.
+
+        Args:
+            index_path: Path to the LEANN index (e.g., "my_index.leann")
+            file_path: Exact path of source file whose chunks should be removed.
+                       Will be normalized to absolute path for comparison.
+
+        Returns:
+            Number of chunks deleted
+
+        Raises:
+            ValueError: If index uses compact format (not supported)
+            FileNotFoundError: If index files are missing
+        """
+        # 1. Load and validate index metadata
+        path = Path(index_path)
+        index_dir = path.parent
+        index_name = path.name
+        index_prefix = path.stem
+
+        meta_path = index_dir / f"{index_name}.meta.json"
+        passages_file = index_dir / f"{index_name}.passages.jsonl"
+        offset_file = index_dir / f"{index_name}.passages.idx"
+        index_file = index_dir / f"{index_prefix}.index"
+        ids_file = (
+            index_dir
+            / f"{index_name[: -len('.leann')] if index_name.endswith('.leann') else index_name}.ids.txt"
+        )
+
+        if not meta_path.exists() or not passages_file.exists() or not offset_file.exists():
+            raise FileNotFoundError("Index metadata or passage files are missing; cannot delete.")
+        if not index_file.exists():
+            raise FileNotFoundError(f"Index file not found: {index_file}")
+
+        with open(meta_path, encoding="utf-8") as f:
+            meta = json.load(f)
+
+        backend_name = meta.get("backend_name")
+        if backend_name != "hnsw":
+            raise ValueError(
+                f"delete_by_file() currently only supports HNSW backend, got '{backend_name}'."
+            )
+
+        meta_backend_kwargs = meta.get("backend_kwargs", {})
+        index_is_compact = meta.get("is_compact", meta_backend_kwargs.get("is_compact", True))
+        if index_is_compact:
+            raise ValueError(
+                "Compact HNSW indices do not support deletion. Rebuild with is_compact=False."
+            )
+
+        # Check if embeddings are stored (needed for reconstruction)
+        is_pruned = bool(meta.get("is_pruned"))
+        is_recompute = bool(meta_backend_kwargs.get("is_recompute"))
+        if is_pruned or is_recompute:
+            raise ValueError(
+                "Cannot delete from indices with pruned embeddings (is_pruned=True or is_recompute=True). "
+                "Embeddings must be stored in the index for reconstruction during rebuild."
+            )
+
+        # 2. Find chunks to delete
+        with open(offset_file, "rb") as f:
+            offset_map: dict[str, int] = pickle.load(f)
+
+        # Normalize target file path for comparison
+        target_path = Path(file_path).resolve()
+
+        chunks_to_keep: list[tuple[str, dict[str, Any]]] = []
+        chunks_to_delete_set: set[str] = set()
+
+        with open(passages_file, encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                chunk = json.loads(line)
+                chunk_id = chunk.get("id", "")
+                metadata = chunk.get("metadata", {})
+
+                # Check both file_path and source fields
+                stored_path = metadata.get("file_path") or metadata.get("source", "")
+
+                # Normalize stored path for comparison
+                should_delete = False
+                if stored_path:
+                    try:
+                        normalized_stored = Path(stored_path).resolve()
+                        if normalized_stored == target_path:
+                            should_delete = True
+                    except (OSError, ValueError):
+                        # Invalid path format, skip
+                        pass
+
+                if should_delete:
+                    chunks_to_delete_set.add(chunk_id)
+                else:
+                    chunks_to_keep.append((chunk_id, chunk))
+
+        # 3. Early return if no chunks match or if all chunks would be deleted
+        if not chunks_to_delete_set:
+            logger.info("No chunks found for file '%s' in index '%s'.", file_path, index_path)
+            return 0
+
+        if not chunks_to_keep:
+            raise ValueError(
+                f"All {len(chunks_to_delete_set)} chunks in the index are from file '{file_path}'. "
+                "Cannot delete all chunks - this would leave an empty index."
+            )
+
+        logger.info(
+            "Found %d chunks to delete from file '%s' in index '%s'. Rebuilding index with %d kept chunks.",
+            len(chunks_to_delete_set),
+            file_path,
+            index_path,
+            len(chunks_to_keep),
+        )
+
+        # 4. Load FAISS index and ID mapping
+        from leann_backend_hnsw import faiss  # type: ignore
+
+        index = faiss.read_index(str(index_file))
+
+        original_id_list: list[str] = []
+        if ids_file.exists():
+            with open(ids_file, encoding="utf-8") as f:
+                original_id_list = [line.strip() for line in f if line.strip()]
+        else:
+            raise FileNotFoundError(
+                f"ID mapping file not found: {ids_file}. "
+                "Cannot safely delete without reliable ID mapping. "
+                "Rebuild the index with a newer LEANN version that creates .ids.txt files."
+            )
+
+        # Build mapping from string ID to FAISS integer ID
+        id_to_faiss_idx = {str_id: idx for idx, str_id in enumerate(original_id_list)}
+
+        # 5. Reconstruct embeddings for kept chunks
+        logger.info("Reconstructing embeddings for %d kept chunks...", len(chunks_to_keep))
+
+        kept_embeddings = []
+        kept_string_ids = []
+        embedding_dim = index.d
+
+        for chunk_id, _ in chunks_to_keep:
+            if chunk_id not in id_to_faiss_idx:
+                logger.warning("Chunk ID '%s' not found in ID mapping, skipping.", chunk_id)
+                continue
+
+            faiss_id = id_to_faiss_idx[chunk_id]
+            embedding = np.zeros(embedding_dim, dtype=np.float32)
+
+            try:
+                index.reconstruct(faiss_id, faiss.swig_ptr(embedding))
+                kept_embeddings.append(embedding)
+                kept_string_ids.append(chunk_id)
+            except Exception as e:
+                raise RuntimeError(
+                    f"Failed to reconstruct embedding for chunk '{chunk_id}' (FAISS ID {faiss_id}). "
+                    f"This typically means embeddings were pruned from the index. Error: {e}"
+                ) from e
+
+        if not kept_embeddings:
+            raise ValueError("No embeddings could be reconstructed. Cannot rebuild index.")
+
+        kept_embeddings_array = np.array(kept_embeddings, dtype=np.float32)
+        logger.info("Successfully reconstructed %d embeddings.", len(kept_embeddings_array))
+
+        # 6. Build new index with kept chunks
+        logger.info("Building new index with kept chunks...")
+
+        # Get backend kwargs from metadata (not self.backend_kwargs)
+        backend_kwargs_for_rebuild = meta_backend_kwargs.copy()
+        backend_kwargs_for_rebuild["dimensions"] = embedding_dim
+        backend_kwargs_for_rebuild["is_compact"] = meta.get(
+            "is_compact", meta_backend_kwargs.get("is_compact", False)
+        )
+        backend_kwargs_for_rebuild["is_recompute"] = meta.get(
+            "is_pruned", meta_backend_kwargs.get("is_recompute", False)
+        )
+
+        # Get backend factory
+        backend_factory = BACKEND_REGISTRY.get(backend_name)
+        if backend_factory is None:
+            raise ValueError(f"Backend '{backend_name}' not found in registry.")
+
+        # Build new index to temporary location first
+        # The backend's build() uses Path(index_path).stem to get the prefix, then appends .index/.ids.txt
+        # Path.stem only removes the LAST extension, so:
+        #   - If we pass "documents.index.rebuild", stem = "documents.index"
+        #   - Backend creates: "documents.index.index" and "documents.index.ids.txt"
+        # We use "_rebuild" (underscore) to avoid the stem stripping issue
+        temp_prefix = str(index_file).replace(".index", "_rebuild")
+        temp_index_actual = index_dir / f"{Path(temp_prefix).stem}.index"
+        temp_ids_path = index_dir / f"{Path(temp_prefix).stem}.ids.txt"
+
+        builder_instance = backend_factory.builder(**backend_kwargs_for_rebuild)
+        builder_instance.build(
+            kept_embeddings_array, kept_string_ids, temp_prefix, **backend_kwargs_for_rebuild
+        )
+
+        # Explicitly write IDs file - don't rely on backend's error-swallowing code
+        # The backend has silent exception handling that can leave the file incomplete
+        with open(temp_ids_path, "w", encoding="utf-8") as f:
+            for kept_id in kept_string_ids:
+                f.write(str(kept_id) + "\n")
+
+        logger.info("Successfully built new index with %d chunks.", len(kept_string_ids))
+
+        # 7. Rewrite passages and metadata atomically
+        passages_file_tmp = passages_file.with_suffix(".jsonl.tmp")
+        offset_file_tmp = offset_file.with_suffix(".idx.tmp")
+
+        try:
+            # Write new passages.jsonl with kept chunks only
+            new_offset_map: dict[str, int] = {}
+            with open(passages_file_tmp, "w", encoding="utf-8") as f:
+                for chunk_id, chunk in chunks_to_keep:
+                    if chunk_id in kept_string_ids:  # Only write chunks that were successfully reconstructed
+                        offset = f.tell()
+                        json.dump(chunk, f, ensure_ascii=False)
+                        f.write("\n")
+                        new_offset_map[chunk_id] = offset
+
+            # Write new passages.idx
+            with open(offset_file_tmp, "wb") as f:
+                pickle.dump(new_offset_map, f)
+
+            # Atomic renames to replace original files
+            # First rename index and IDs files (these were built to temp location)
+            temp_index_actual.replace(index_file)
+            temp_ids_path.replace(ids_file)
+
+            # Then rename passages files
+            passages_file_tmp.replace(passages_file)
+            offset_file_tmp.replace(offset_file)
+
+        except Exception as e:
+            # Cleanup temp files on failure
+            for tmp_file in [passages_file_tmp, offset_file_tmp, temp_index_actual, temp_ids_path]:
+                if tmp_file.exists():
+                    tmp_file.unlink()
+            raise RuntimeError(f"Failed to rewrite index files: {e}") from e
+
+        # 8. Update metadata
+        meta["total_passages"] = len(new_offset_map)
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=2)
+
+        deleted_count = len(chunks_to_delete_set)
+        logger.info(
+            "Deleted %d chunks from file '%s' in index '%s'. Remaining: %d",
+            deleted_count,
+            file_path,
+            index_path,
+            len(new_offset_map),
+        )
+
+        return deleted_count
+
+    def update_file(self, index_path: str, file_path: str) -> tuple[int, int]:
+        """
+        Re-index a single file by removing old chunks and adding new ones.
+
+        This is the primary method for handling file edits - it removes stale
+        chunks from the previous version and indexes the current version.
+
+        Args:
+            index_path: Path to the LEANN index
+            file_path: Path to the file to re-index
+
+        Returns:
+            Tuple of (chunks_deleted, chunks_added)
+
+        Raises:
+            ValueError: If index uses compact format
+            FileNotFoundError: If index or file not found
+        """
+        # Step 1: Delete old chunks
+        deleted_count = self.delete_by_file(index_path, file_path)
+
+        # Clear any stale chunks from previous operations
+        self.chunks.clear()
+
+        # Step 2: Check if file still exists
+        file_path_obj = Path(file_path)
+        if not file_path_obj.exists():
+            logger.info("File '%s' was deleted. Removed %d chunks.", file_path, deleted_count)
+            return (deleted_count, 0)
+
+        # Step 3: Load index metadata for chunking settings
+        path = Path(index_path)
+        index_dir = path.parent
+        index_name = path.name
+
+        meta_path = index_dir / f"{index_name}.meta.json"
+        if not meta_path.exists():
+            raise FileNotFoundError(f"Index metadata not found: {meta_path}")
+
+        with open(meta_path, encoding="utf-8") as f:
+            meta = json.load(f)
+
+        # Extract embedding configuration and sync to self for update_index()
+        embedding_model = meta.get("embedding_model")
+        embedding_mode = meta.get("embedding_mode", "sentence-transformers")
+        embedding_options = meta.get("embedding_options", {})
+
+        # Sync embedding settings to self so update_index() uses the correct model
+        if embedding_model:
+            self.embedding_model = embedding_model
+        self.embedding_mode = embedding_mode
+        self.embedding_options = embedding_options
+
+        # Step 4: Load and chunk the file
+        logger.info("Loading file '%s' for re-indexing...", file_path)
+
+        try:
+            from llama_index.core import SimpleDirectoryReader
+
+            # Load the single file
+            documents = SimpleDirectoryReader(
+                input_files=[str(file_path_obj.resolve())], filename_as_id=True
+            ).load_data()
+
+            if not documents:
+                logger.warning("Could not load file '%s', no chunks to add.", file_path)
+                return (deleted_count, 0)
+
+        except Exception as e:
+            logger.error("Failed to load file '%s': %s", file_path, e)
+            raise RuntimeError(f"Failed to load file '{file_path}': {e}") from e
+
+        # Step 5: Chunk the file using appropriate settings
+        # Determine if this is a code file
+        code_file_exts = {
+            ".py",
+            ".js",
+            ".ts",
+            ".jsx",
+            ".tsx",
+            ".java",
+            ".cpp",
+            ".c",
+            ".h",
+            ".hpp",
+            ".cs",
+            ".go",
+            ".rs",
+            ".rb",
+            ".php",
+            ".swift",
+            ".kt",
+            ".scala",
+        }
+        is_code_file = file_path_obj.suffix.lower() in code_file_exts
+
+        # Use code-optimized chunking settings for code files, doc settings for others
+        # These are reasonable defaults matching CLI behavior
+        if is_code_file:
+            chunk_size = 512
+            chunk_overlap = 50
+        else:
+            chunk_size = 256
+            chunk_overlap = 128
+
+        from llama_index.core.node_parser import SentenceSplitter
+
+        node_parser = SentenceSplitter(
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            separator="\n" if is_code_file else " ",
+            paragraph_separator="\n\n",
+        )
+
+        import uuid
+
+        new_chunks: list[dict[str, Any]] = []
+        for doc in documents:
+            nodes = node_parser.get_nodes_from_documents([doc])
+            for node in nodes:
+                # Generate unique ID for each chunk to avoid conflicts with existing chunks
+                chunk_metadata = {
+                    "id": str(uuid.uuid4()),
+                    "file_path": str(file_path_obj.resolve()),
+                    "file_name": file_path_obj.name,
+                }
+
+                # Add optional metadata if available
+                if "creation_date" in doc.metadata:
+                    chunk_metadata["creation_date"] = doc.metadata["creation_date"]
+                if "last_modified_date" in doc.metadata:
+                    chunk_metadata["last_modified_date"] = doc.metadata["last_modified_date"]
+
+                new_chunks.append({"text": node.get_content(), "metadata": chunk_metadata})
+
+        if not new_chunks:
+            logger.warning("No chunks created from file '%s'", file_path)
+            return (deleted_count, 0)
+
+        # Filter out chunks with empty or whitespace-only text
+        valid_chunks = [c for c in new_chunks if c.get("text", "").strip()]
+        if not valid_chunks:
+            logger.warning(
+                "File '%s' produced %d chunks but none had valid text content. Skipping.",
+                file_path,
+                len(new_chunks),
+            )
+            return (deleted_count, 0)
+
+        logger.info("Created %d new chunks from file '%s'", len(valid_chunks), file_path)
+
+        # Step 6: Add new chunks using existing builder's add_text method
+        for chunk in valid_chunks:
+            self.add_text(chunk["text"], metadata=chunk["metadata"])
+
+        # Step 7: Update the index (appends to existing index)
+        try:
+            self.update_index(index_path)
+            added_count = len(valid_chunks)
+            logger.info(
+                "Updated file '%s': deleted %d, added %d chunks",
+                file_path,
+                deleted_count,
+                added_count,
+            )
+            return (deleted_count, added_count)
+        except Exception as e:
+            logger.error("Failed to update index after chunking file '%s': %s", file_path, e)
+            raise RuntimeError(f"Failed to update index: {e}") from e
+
+    @staticmethod
+    def _compute_file_hash(file_path: Path) -> str:
+        """Compute SHA256 hash of file contents."""
+        import hashlib
+
+        sha256 = hashlib.sha256()
+        with open(file_path, "rb") as f:
+            for chunk in iter(lambda: f.read(8192), b""):
+                sha256.update(chunk)
+        return sha256.hexdigest()
+
+    def sync_index(
+        self,
+        index_path: str,
+        docs_path: Union[str, list[str]],
+        file_filter: Optional[Callable[[str], bool]] = None,
+    ) -> dict[str, int]:
+        """
+        Sync an index with one or more directories, detecting and handling file changes.
+
+        Uses content hashes to detect:
+        - New files: Added to index
+        - Modified files: Old chunks deleted, new chunks added
+        - Deleted files: Chunks removed from index
+
+        Note: The file_filter is applied to the current directory scan. Files that
+        previously passed the filter but no longer do will be treated as deleted.
+        This means changing the filter will cause previously-indexed files to be
+        removed if they don't match the new filter.
+
+        Args:
+            index_path: Path to the LEANN index
+            docs_path: Path to directory (or list of directories) to sync
+            file_filter: Optional function to filter files (returns True to include).
+                        Applied to absolute file paths.
+
+        Returns:
+            Dict with counts: {"added": N, "modified": N, "deleted": N,
+                              "unchanged": N, "chunks_added": N, "chunks_deleted": N}
+
+        Raises:
+            ValueError: If index uses compact format or has pruned embeddings
+            FileNotFoundError: If index or directory not found
+        """
+        # 1. Validate index exists and is compatible
+        path = Path(index_path)
+        index_dir = path.parent
+        index_name = path.name
+
+        meta_path = index_dir / f"{index_name}.meta.json"
+        if not meta_path.exists():
+            raise FileNotFoundError(f"Index metadata not found: {meta_path}")
+
+        with open(meta_path, encoding="utf-8") as f:
+            meta = json.load(f)
+
+        # Check if index supports updates
+        backend_name = meta.get("backend_name")
+        if backend_name != "hnsw":
+            raise ValueError(f"sync_index() currently only supports HNSW backend, got '{backend_name}'.")
+
+        meta_backend_kwargs = meta.get("backend_kwargs", {})
+        index_is_compact = meta.get("is_compact", meta_backend_kwargs.get("is_compact", True))
+        if index_is_compact:
+            raise ValueError(
+                "Compact HNSW indices do not support sync operations. Rebuild with is_compact=False."
+            )
+
+        # Check if embeddings are stored (needed for deletion/reconstruction)
+        is_pruned = bool(meta.get("is_pruned"))
+        is_recompute = bool(meta_backend_kwargs.get("is_recompute"))
+        if is_pruned or is_recompute:
+            raise ValueError(
+                "Cannot sync indices with pruned embeddings (is_pruned=True or is_recompute=True). "
+                "Sync requires stored embeddings for reconstruction. Rebuild with is_recompute=False."
+            )
+
+        # 2. Load existing file hashes (or empty dict if first sync)
+        hash_file = index_dir / f"{index_name}.file_hashes.json"
+        old_hashes: dict[str, dict[str, Any]] = {}
+        if hash_file.exists():
+            with open(hash_file, encoding="utf-8") as f:
+                raw_hashes = json.load(f)
+            # Migrate from old format ({path: hash_str}) to new ({path: {hash, mtime, size}})
+            for fpath, val in raw_hashes.items():
+                if isinstance(val, str):
+                    old_hashes[fpath] = {"hash": val, "mtime": 0.0, "size": -1}
+                else:
+                    old_hashes[fpath] = val
+
+        # Normalize docs_path to a list
+        if isinstance(docs_path, str):
+            docs_paths = [docs_path]
+        else:
+            docs_paths = docs_path
+
+        logger.info("Syncing index '%s' with %d director%s", index_path, len(docs_paths), "y" if len(docs_paths) == 1 else "ies")
+        if old_hashes:
+            logger.info("Loaded %d file hashes from previous sync", len(old_hashes))
+        else:
+            logger.info("First sync - treating all files as new")
+
+        # 3. Scan ALL directories and compute new hashes
+        # Optimization: use mtime+size to skip hash computation for unchanged files
+        new_hashes: dict[str, dict[str, Any]] = {}
+        hash_skipped = 0
+        hash_computed = 0
+        logger.info("Scanning %d director%s...", len(docs_paths), "y" if len(docs_paths) == 1 else "ies")
+
+        for docs_path_item in docs_paths:
+            docs_dir = Path(docs_path_item)
+            if not docs_dir.exists():
+                raise FileNotFoundError(f"Directory not found: {docs_path_item}")
+            if not docs_dir.is_dir():
+                raise ValueError(f"Not a directory: {docs_path_item}")
+
+            for file_path in docs_dir.rglob("*"):
+                if not file_path.is_file():
+                    continue
+
+                abs_path = str(file_path.resolve())
+
+                # Apply file filter if provided
+                if file_filter and not file_filter(abs_path):
+                    continue
+
+                try:
+                    stat = file_path.stat()
+                    cur_mtime = stat.st_mtime
+                    cur_size = stat.st_size
+
+                    # Fast path: if mtime and size match previous sync, reuse cached hash
+                    old_entry = old_hashes.get(abs_path)
+                    if (
+                        old_entry
+                        and old_entry.get("mtime") == cur_mtime
+                        and old_entry.get("size") == cur_size
+                    ):
+                        new_hashes[abs_path] = old_entry
+                        hash_skipped += 1
+                    else:
+                        file_hash = self._compute_file_hash(file_path)
+                        new_hashes[abs_path] = {
+                            "hash": file_hash,
+                            "mtime": cur_mtime,
+                            "size": cur_size,
+                        }
+                        hash_computed += 1
+                except (OSError, IOError) as e:
+                    logger.warning("Failed to read file '%s': %s. Skipping.", abs_path, e)
+                    continue
+
+        logger.info(
+            "Found %d files across all directories (hashes: %d cached, %d computed)",
+            len(new_hashes), hash_skipped, hash_computed,
+        )
+
+        # 4. Categorize files
+        old_files = set(old_hashes.keys())
+        new_files = set(new_hashes.keys())
+
+        deleted_files = old_files - new_files
+        added_files = new_files - old_files
+        common_files = old_files & new_files
+        modified_files = {f for f in common_files if old_hashes[f].get("hash") != new_hashes[f].get("hash")}
+        unchanged_files = common_files - modified_files
+
+        logger.info(
+            "Change summary: %d added, %d modified, %d deleted, %d unchanged",
+            len(added_files),
+            len(modified_files),
+            len(deleted_files),
+            len(unchanged_files),
+        )
+
+        # 5. Process changes
+        stats = {
+            "added": 0,
+            "modified": 0,
+            "deleted": 0,
+            "unchanged": len(unchanged_files),
+            "chunks_added": 0,
+            "chunks_deleted": 0,
+        }
+
+        # Handle deleted files
+        for file_path in deleted_files:
+            try:
+                deleted_count = self.delete_by_file(index_path, file_path)
+                stats["deleted"] += 1
+                stats["chunks_deleted"] += deleted_count
+                logger.info("Deleted %d chunks from removed file '%s'", deleted_count, file_path)
+            except Exception as e:
+                logger.error("Failed to delete chunks for file '%s': %s", file_path, e)
+                raise
+
+        # Handle modified files
+        for file_path in modified_files:
+            try:
+                deleted, added = self.update_file(index_path, file_path)
+                stats["modified"] += 1
+                stats["chunks_deleted"] += deleted
+                stats["chunks_added"] += added
+                logger.info(
+                    "Updated modified file '%s': deleted %d, added %d chunks",
+                    file_path,
+                    deleted,
+                    added,
+                )
+            except Exception as e:
+                logger.warning("Failed to update file '%s': %s. Skipping.", file_path, e)
+                stats["skipped"] = stats.get("skipped", 0) + 1
+
+        # Handle new files
+        for file_path in added_files:
+            try:
+                # Use update_file which handles non-existent files gracefully
+                # (delete returns 0, then adds new chunks)
+                deleted, added = self.update_file(index_path, file_path)
+                stats["added"] += 1
+                stats["chunks_added"] += added
+                logger.info("Added new file '%s': %d chunks", file_path, added)
+            except Exception as e:
+                logger.warning("Failed to add file '%s': %s. Skipping.", file_path, e)
+                stats["skipped"] = stats.get("skipped", 0) + 1
+
+        # 6. Save new hashes
+        try:
+            with open(hash_file, "w", encoding="utf-8") as f:
+                json.dump(new_hashes, f, indent=2)
+            logger.info("Saved %d file hashes to '%s'", len(new_hashes), hash_file)
+        except (OSError, IOError) as e:
+            logger.error("Failed to save hash file: %s", e)
+            raise
+
+        logger.info(
+            "Sync complete: %d added, %d modified, %d deleted, %d unchanged. "
+            "Chunks: +%d, -%d",
+            stats["added"],
+            stats["modified"],
+            stats["deleted"],
+            stats["unchanged"],
+            stats["chunks_added"],
+            stats["chunks_deleted"],
+        )
+
+        return stats
 
 
 class LeannSearcher:
