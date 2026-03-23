@@ -1296,16 +1296,26 @@ class LeannBuilder:
             logger.warning("No chunks created from file '%s'", file_path)
             return (deleted_count, 0)
 
-        logger.info("Created %d new chunks from file '%s'", len(new_chunks), file_path)
+        # Filter out chunks with empty or whitespace-only text
+        valid_chunks = [c for c in new_chunks if c.get("text", "").strip()]
+        if not valid_chunks:
+            logger.warning(
+                "File '%s' produced %d chunks but none had valid text content. Skipping.",
+                file_path,
+                len(new_chunks),
+            )
+            return (deleted_count, 0)
+
+        logger.info("Created %d new chunks from file '%s'", len(valid_chunks), file_path)
 
         # Step 6: Add new chunks using existing builder's add_text method
-        for chunk in new_chunks:
+        for chunk in valid_chunks:
             self.add_text(chunk["text"], metadata=chunk["metadata"])
 
         # Step 7: Update the index (appends to existing index)
         try:
             self.update_index(index_path)
-            added_count = len(new_chunks)
+            added_count = len(valid_chunks)
             logger.info(
                 "Updated file '%s': deleted %d, added %d chunks",
                 file_path,
@@ -1396,11 +1406,16 @@ class LeannBuilder:
 
         # 2. Load existing file hashes (or empty dict if first sync)
         hash_file = index_dir / f"{index_name}.file_hashes.json"
+        old_hashes: dict[str, dict[str, Any]] = {}
         if hash_file.exists():
             with open(hash_file, encoding="utf-8") as f:
-                old_hashes = json.load(f)
-        else:
-            old_hashes = {}
+                raw_hashes = json.load(f)
+            # Migrate from old format ({path: hash_str}) to new ({path: {hash, mtime, size}})
+            for fpath, val in raw_hashes.items():
+                if isinstance(val, str):
+                    old_hashes[fpath] = {"hash": val, "mtime": 0.0, "size": -1}
+                else:
+                    old_hashes[fpath] = val
 
         # Normalize docs_path to a list
         if isinstance(docs_path, str):
@@ -1415,8 +1430,11 @@ class LeannBuilder:
             logger.info("First sync - treating all files as new")
 
         # 3. Scan ALL directories and compute new hashes
-        new_hashes: dict[str, str] = {}
-        logger.info("Scanning %d director%s and computing file hashes...", len(docs_paths), "y" if len(docs_paths) == 1 else "ies")
+        # Optimization: use mtime+size to skip hash computation for unchanged files
+        new_hashes: dict[str, dict[str, Any]] = {}
+        hash_skipped = 0
+        hash_computed = 0
+        logger.info("Scanning %d director%s...", len(docs_paths), "y" if len(docs_paths) == 1 else "ies")
 
         for docs_path_item in docs_paths:
             docs_dir = Path(docs_path_item)
@@ -1436,13 +1454,35 @@ class LeannBuilder:
                     continue
 
                 try:
-                    file_hash = self._compute_file_hash(file_path)
-                    new_hashes[abs_path] = file_hash
+                    stat = file_path.stat()
+                    cur_mtime = stat.st_mtime
+                    cur_size = stat.st_size
+
+                    # Fast path: if mtime and size match previous sync, reuse cached hash
+                    old_entry = old_hashes.get(abs_path)
+                    if (
+                        old_entry
+                        and old_entry.get("mtime") == cur_mtime
+                        and old_entry.get("size") == cur_size
+                    ):
+                        new_hashes[abs_path] = old_entry
+                        hash_skipped += 1
+                    else:
+                        file_hash = self._compute_file_hash(file_path)
+                        new_hashes[abs_path] = {
+                            "hash": file_hash,
+                            "mtime": cur_mtime,
+                            "size": cur_size,
+                        }
+                        hash_computed += 1
                 except (OSError, IOError) as e:
                     logger.warning("Failed to read file '%s': %s. Skipping.", abs_path, e)
                     continue
 
-        logger.info("Found %d files across all directories", len(new_hashes))
+        logger.info(
+            "Found %d files across all directories (hashes: %d cached, %d computed)",
+            len(new_hashes), hash_skipped, hash_computed,
+        )
 
         # 4. Categorize files
         old_files = set(old_hashes.keys())
@@ -1451,7 +1491,7 @@ class LeannBuilder:
         deleted_files = old_files - new_files
         added_files = new_files - old_files
         common_files = old_files & new_files
-        modified_files = {f for f in common_files if old_hashes[f] != new_hashes[f]}
+        modified_files = {f for f in common_files if old_hashes[f].get("hash") != new_hashes[f].get("hash")}
         unchanged_files = common_files - modified_files
 
         logger.info(
@@ -1497,8 +1537,8 @@ class LeannBuilder:
                     added,
                 )
             except Exception as e:
-                logger.error("Failed to update file '%s': %s", file_path, e)
-                raise
+                logger.warning("Failed to update file '%s': %s. Skipping.", file_path, e)
+                stats["skipped"] = stats.get("skipped", 0) + 1
 
         # Handle new files
         for file_path in added_files:
@@ -1510,8 +1550,8 @@ class LeannBuilder:
                 stats["chunks_added"] += added
                 logger.info("Added new file '%s': %d chunks", file_path, added)
             except Exception as e:
-                logger.error("Failed to add file '%s': %s", file_path, e)
-                raise
+                logger.warning("Failed to add file '%s': %s. Skipping.", file_path, e)
+                stats["skipped"] = stats.get("skipped", 0) + 1
 
         # 6. Save new hashes
         try:

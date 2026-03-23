@@ -2071,6 +2071,8 @@ Examples:
             print(f"   Modified:  {stats['modified']} files")
             print(f"   Deleted:   {stats['deleted']} files (-{stats['chunks_deleted']} chunks)")
             print(f"   Unchanged: {stats['unchanged']} files")
+            if stats.get("skipped"):
+                print(f"   ⚠️  Skipped: {stats['skipped']} files (see logs for details)")
         except ValueError as e:
             print(f"❌ Cannot sync: {e}")
         except FileNotFoundError as e:
